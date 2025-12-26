@@ -15,18 +15,17 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram(msg: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. Check GitHub Secrets.")
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+    r = requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=20)
 
-# =========================
-# 資料來源（TWSE 公開 API）
-# =========================
-TWSE_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-TWSE_INDEX = "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX"
+    print("Telegram status:", r.status_code)
+    print("Telegram response:", r.text)
 
-# =========================
-# 技術指標工具
-# =========================
+    r.raise_for_status()
+
 def sma(s, n):
     return s.rolling(n).mean()
 
@@ -52,6 +51,14 @@ def market_is_bullish():
 # 主掃描邏輯
 # =========================
 def run():
+    if __name__ == "__main__":
+    try:
+        run()
+        print("scanner finished")
+    except Exception as e:
+        print("scanner error:", repr(e))
+        raise
+
     if not market_is_bullish():
         send_telegram("❌ 今日大盤不利（未符合多頭前提），未執行選股")
         return
