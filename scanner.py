@@ -2,119 +2,122 @@ import os
 import datetime as dt
 import requests
 import pandas as pd
-print("=== scanner.py is running ===")
 
-
-# -------- Secrets --------
+# =====================
+# Secrets
+# =====================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "")
 
-# -------- Telegram --------
-def send_telegram(msg: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+# =====================
+# Telegram
+# =====================
+def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=20)
-    print("Telegram status:", r.status_code)
-    print("Telegram response:", r.text)
-    r.raise_for_status()
+    requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=20)
 
-# -------- Time (Taipei) --------
-def today_tpe() -> dt.date:
+# =====================
+# Time helpers (Taipei)
+# =====================
+def today_tpe():
     return (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
 
-def fmt(d: dt.date) -> str:
+def fmt(d):
     return d.strftime("%Y-%m-%d")
 
-# -------- TWSE snapshot (prefilter) --------
+# =====================
+# TWSE snapshot (當日)
+# =====================
 TWSE_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 
-def load_twse_snapshot() -> pd.DataFrame:
-    r = requests.get(TWSE_ALL, timeout=30)
-    print("TWSE status:", r.status_code)
-    r.raise_for_status()
-    df = pd.DataFrame(r.json())
-    print("TWSE columns:", list(df.columns))
+def load_twse_snapshot():
+    df = pd.DataFrame(requests.get(TWSE_ALL, timeout=30).json())
 
-    # Columns in your log:
-    # OpeningPrice, HighestPrice, LowestPrice, ClosingPrice, TradeVolume, Change
-    df2 = df[["Code","Name","OpeningPrice","HighestPrice","LowestPrice","ClosingPrice","TradeVolume","Change"]].copy()
-    df2.columns = ["Code","Name","Open","High","Low","Close","TradeVolume","Change"]
+    df = df[[
+        "Code","Name",
+        "OpeningPrice","HighestPrice","LowestPrice","ClosingPrice",
+        "TradeVolume","Change"
+    ]].copy()
+
+    df.columns = ["Code","Name","Open","High","Low","Close","TradeVolume","Change"]
 
     for c in ["Open","High","Low","Close","TradeVolume","Change"]:
-        df2[c] = pd.to_numeric(df2[c], errors="coerce")
-    df2 = df2.dropna()
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df2["Code"] = df2["Code"].astype(str)
-    df2 = df2[df2["Code"].str.len() == 4].copy()
-    df2 = df2[(df2["High"] - df2["Low"]) > 0].copy()
+    df = df.dropna()
+    df["Code"] = df["Code"].astype(str)
+    df = df[df["Code"].str.len() == 4]
+    df = df[(df["High"] - df["Low"]) > 0]
 
-    df2["body_ratio"] = (df2["Close"] - df2["Open"]) / (df2["High"] - df2["Low"])
-    return df2
-
-# -------- FinMind --------
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-
-def finmind_get(dataset: str, data_id: str, start_date: str, end_date: str) -> pd.DataFrame:
-    if not FINMIND_TOKEN:
-        raise RuntimeError("Missing FINMIND_TOKEN (check GitHub Secrets + run.yml env).")
-
-    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
-    params = {"dataset": dataset, "data_id": data_id, "start_date": start_date, "end_date": end_date}
-    r = requests.get(FINMIND_URL, headers=headers, params=params, timeout=30)
-
-    print("FinMind status:", r.status_code, "dataset:", dataset, "data_id:", data_id)
-    r.raise_for_status()
-
-    j = r.json()
-    if j.get("status") != 200:
-        raise RuntimeError(f"FinMind API status not 200: {j}")
-
-    df = pd.DataFrame(j.get("data", []))
+    df["body_ratio"] = (df["Close"] - df["Open"]) / (df["High"] - df["Low"])
     return df
 
-def get_price_history(stock_id: str, days: int = 160) -> pd.DataFrame:
+# =====================
+# FinMind API
+# =====================
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+
+def finmind_price(stock_id, days=200):
     end = today_tpe()
     start = end - dt.timedelta(days=days)
-    df = finmind_get("TaiwanStockPrice", stock_id, fmt(start), fmt(end))
-    if df.empty:
-        return df
 
+    r = requests.get(
+        FINMIND_URL,
+        headers={"Authorization": f"Bearer {FINMIND_TOKEN}"},
+        params={
+            "dataset": "TaiwanStockPrice",
+            "data_id": stock_id,
+            "start_date": fmt(start),
+            "end_date": fmt(end)
+        },
+        timeout=30
+    )
+    data = r.json()["data"]
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
     df["date"] = pd.to_datetime(df["date"])
     for c in ["open","max","min","close","Trading_Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["date","open","max","min","close","Trading_Volume"]).sort_values("date")
-    return df
+    return df.dropna().sort_values("date")
 
-# -------- Strategy (your final agreed rules) --------
-def market_ok_ma60() -> tuple[bool, float, float]:
-    hist = get_price_history("^TWII", days=200)
-    if hist.empty or len(hist) < 80:
-        raise RuntimeError("Not enough ^TWII history for MA60")
+# =====================
+# 大盤季線
+# =====================
+def market_above_ma60():
+    df = finmind_price("^TWII", 200)
+    ma60 = df["close"].rolling(60).mean()
+    return df["close"].iloc[-1] > ma60.iloc[-1]
 
-    ma60 = hist["close"].rolling(60).mean()
-    last_close = float(hist["close"].iloc[-1])
-    last_ma60 = float(ma60.iloc[-1])
-    return (last_close > last_ma60), last_close, last_ma60
+# =====================
+# 個股完整條件
+# =====================
+def check_stock(stock_id, snap):
+    hist = finmind_price(stock_id, 200)
+    if len(hist) < 30:
+        return None
 
-def check_full(stock_id: str, snap_row: pd.Series) -> tuple[bool, dict]:
-    hist = get_price_history(stock_id, days=200)
-    if hist.empty or len(hist) < 30:
-        return False, {"reason":"history too short"}
+    v_today = snap["TradeVolume"]
+    o, c = snap["Open"], snap["Close"]
+    body_ratio = snap["body_ratio"]
+    chg = snap["Change"]
 
-    # From snapshot (today)
-    v_today = float(snap_row["TradeVolume"])   # shares
-    o = float(snap_row["Open"])
-    h = float(snap_row["High"])
-    l = float(snap_row["Low"])
-    c = float(snap_row["Close"])
-    chg = float(snap_row["Change"])
-    body_ratio = float(snap_row["body_ratio"])
+    lots_1500 = 1500 * 1000
 
-    lots_threshold = 1500 * 1000  # 1500張 -> 股數
+    vol = hist["Trading_Volume"]
+    ma5 = vol.iloc[-6:-1].mean()
 
-    # 5-day avg volume excluding today using history
-    vol = hist["Trading_Volume"].astype(float)
-    if len(vol) < 10:
-        return False,
+    # 爆量長紅
+    if not (
+        v_today >= lots_1500 and
+        chg >= 4 and
+        c > o and
+        body_ratio >= 0.6 and
+        v_today > 3 * ma5
+    ):
+        return None
+
+    # 盤整突破
+    prev20
