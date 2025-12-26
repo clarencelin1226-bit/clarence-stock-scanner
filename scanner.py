@@ -10,13 +10,15 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "")
 TWSE_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
+# 用 0050 當作大盤 Proxy 來算 MA60（避免 ^TWII 資料不足）
+MARKET_PROXY = "0050"
+
 def send_telegram(msg: str):
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    # split long message to avoid Telegram limit
     chunk_size = 3500
     parts = [msg[i:i+chunk_size] for i in range(0, len(msg), chunk_size)] or [""]
 
@@ -52,7 +54,7 @@ def load_twse_snapshot():
     df["body_ratio"] = (df["Close"] - df["Open"]) / (df["High"] - df["Low"])
     return df
 
-def finmind_price(stock_id, days=220):
+def finmind_price(stock_id, days=400):
     if not FINMIND_TOKEN:
         raise RuntimeError("Missing FINMIND_TOKEN")
 
@@ -84,17 +86,30 @@ def finmind_price(stock_id, days=220):
     df["date"] = pd.to_datetime(df["date"])
     for c in ["open","max","min","close","Trading_Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna().sort_values("date")
+    df = df.dropna().sort_values("date")
+    return df
 
 def market_above_ma60():
-    df = finmind_price("^TWII", 260)
+    df = finmind_price(MARKET_PROXY, 500)
     if df.empty or len(df) < 80:
-        raise RuntimeError("Not enough ^TWII history for MA60")
+        # 不要讓 workflow 直接 fail，改成發 Telegram 提示並停掉
+        send_telegram(f"⚠️ 大盤濾網資料不足：{MARKET_PROXY} 日K不足以計算 MA60")
+        return False
+
     ma60 = df["close"].rolling(60).mean()
-    return float(df["close"].iloc[-1]) > float(ma60.iloc[-1])
+    last_close = float(df["close"].iloc[-1])
+    last_ma60 = float(ma60.iloc[-1])
+
+    # 也把結果寫進 Telegram，避免你看不到為何沒選股
+    if last_close <= last_ma60:
+        send_telegram(f"❌ 大盤未站上季線：{MARKET_PROXY} 收盤 {last_close:.2f} ≤ MA60 {last_ma60:.2f}")
+        return False
+
+    send_telegram(f"✅ 大盤站上季線：{MARKET_PROXY} 收盤 {last_close:.2f} > MA60 {last_ma60:.2f}")
+    return True
 
 def check_stock(code, snap_row):
-    hist = finmind_price(code, 260)
+    hist = finmind_price(code, 500)
     if hist.empty or len(hist) < 30:
         return None
 
@@ -115,6 +130,9 @@ def check_stock(code, snap_row):
 
     # 盤整突破（前 20 日）
     prev20 = hist.iloc[-21:-1]
+    if len(prev20) < 20:
+        return None
+
     hi = float(prev20["max"].max())
     lo = float(prev20["min"].min())
     width = (hi - lo) / lo if lo > 0 else 999
@@ -129,13 +147,10 @@ def check_stock(code, snap_row):
         "chg": chg,
         "vol_mult": (v_today / ma5) if ma5 > 0 else None,
         "break_pct": (c / hi - 1.0),
-        "width": width
     }
 
 def run():
-    # 不印太多，只留最必要線索
     if not market_above_ma60():
-        send_telegram("❌ 大盤未站上季線（MA60），今日不進行選股")
         return
 
     snap = load_twse_snapshot()
@@ -156,7 +171,7 @@ def run():
             )
 
     if not hits:
-        send_telegram("✅ 大盤多頭，但今日無符合『爆量長紅＋盤整突破』個股")
+        send_telegram("✅ 今日無符合『爆量長紅＋盤整突破（含3×5日均量）』個股")
     else:
         send_telegram("📈 台股突破清單\n" + "\n".join(hits))
 
