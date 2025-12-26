@@ -2,6 +2,8 @@ import os
 import datetime as dt
 import requests
 import pandas as pd
+print("=== scanner.py is running ===")
+
 
 # -------- Secrets --------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
