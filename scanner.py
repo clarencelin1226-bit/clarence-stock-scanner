@@ -1,12 +1,11 @@
 # scanner.py
 # 台股上市：骨架版（先跑通）+ Debug 版（把錯誤印出來）
-# 目前使用 TWSE 公開 API 的「當日快照」資料
-# 後續我們會再升級成：MA60 / 5日均量3倍 / 20日盤整突破1% / 強勢族群排序（需歷史資料）
+# 使用 TWSE 公開 API：/exchangeReport/STOCK_DAY_ALL（當日快照）
+# 後續我們再升級成：MA60 / 5日均量3倍 / 20日盤整突破1% / 強勢族群排序（需歷史資料）
 
 import os
 import requests
 import pandas as pd
-
 
 # =========================
 # Telegram 設定（從 GitHub Secrets 讀）
@@ -14,9 +13,7 @@ import pandas as pd
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-
 def send_telegram(msg: str) -> None:
-    """Send message to Telegram and print response for debugging."""
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError(
             "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. "
@@ -32,91 +29,60 @@ def send_telegram(msg: str) -> None:
 
     r.raise_for_status()
 
-
 # =========================
-# TWSE 公開 API（當日快照）
+# TWSE API
 # =========================
 TWSE_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 
+def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Return first existing column name from candidates."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
 def load_stocks_today() -> pd.DataFrame:
-    """
-    Load today's TWSE listed stock snapshot.
-    Expected columns include: Code, Name, Open, High, Low, Close, TradeVolume, Change
-    """
     resp = requests.get(TWSE_ALL, timeout=30)
     print("TWSE STOCK_DAY_ALL status:", resp.status_code)
-
     resp.raise_for_status()
+
     data = resp.json()
     if not isinstance(data, list) or len(data) == 0:
         raise RuntimeError("TWSE API returned empty or non-list data.")
 
     df = pd.DataFrame(data)
+    print("TWSE columns:", list(df.columns))
 
-    # Keep 4-digit stock codes only
-    df = df[df["Code"].astype(str).str.len() == 4].copy()
+    # 股票代碼/名稱欄位（常見 Code/Name，也可能有不同命名）
+    code_col = _pick_col(df, ["Code", "code", "股票代號", "證券代號", "證券代碼"])
+    name_col = _pick_col(df, ["Name", "name", "股票名稱", "證券名稱", "名稱"])
 
-    # Convert numeric columns
-    for c in ["Open", "High", "Low", "Close", "TradeVolume", "Change"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    # 價格欄位：可能是 Open/High/Low/Close，也可能是 OpeningPrice/HighestPrice...
+    open_col  = _pick_col(df, ["Open", "OpeningPrice", "open", "開盤價"])
+    high_col  = _pick_col(df, ["High", "HighestPrice", "high", "最高價"])
+    low_col   = _pick_col(df, ["Low", "LowestPrice", "low", "最低價"])
+    close_col = _pick_col(df, ["Close", "ClosingPrice", "close", "收盤價"])
 
-    df = df.dropna(subset=["Open", "High", "Low", "Close", "TradeVolume", "Change"])
+    # 成交量欄位：有些是 TradeVolume，有些是 Volume，有些是 成交股數
+    vol_col   = _pick_col(df, ["TradeVolume", "Volume", "TradeVolumeShares", "成交股數", "成交量"])
 
-    # Avoid division by zero
-    df = df[(df["High"] - df["Low"]) > 0]
+    # 漲跌幅欄位：有些用 Change(%)，有些可能是 漲跌幅
+    chg_col   = _pick_col(df, ["Change", "ChangePercent", "PctChange", "漲跌幅", "漲跌百分比"])
 
-    return df
+    missing = {
+        "code_col": code_col, "name_col": name_col,
+        "open_col": open_col, "high_col": high_col, "low_col": low_col, "close_col": close_col,
+        "vol_col": vol_col, "chg_col": chg_col
+    }
+    print("Picked columns:", missing)
 
-
-def run() -> None:
-    """
-    Current skeleton logic:
-    - Listed stocks only
-    - Long red candle (Close > Open) with body ratio >= 0.6
-    - Change >= +4%
-    - TradeVolume > 1500 (TWSE data is usually shares; we treat as "張門檻" skeleton for now)
-    NOTE: Full strategy will be added later with historical data.
-    """
-    df = load_stocks_today()
-
-    # Candle body ratio
-    df["body_ratio"] = (df["Close"] - df["Open"]) / (df["High"] - df["Low"])
-
-    # Skeleton candidate filter (matches the "長紅+漲幅+量門檻" portion)
-    candidates = df[
-        (df["TradeVolume"] > 1500) &
-        (df["Change"] >= 4) &
-        (df["Close"] > df["Open"]) &
-        (df["body_ratio"] >= 0.6)
-    ].copy()
-
-    if candidates.empty:
-        send_telegram("✅ 今日掃描完成：無符合『長紅＋漲幅≥4%＋量門檻』的上市股票（骨架版）")
-        return
-
-    # Build message (limit to avoid Telegram message too long)
-    candidates = candidates.sort_values(["Change", "TradeVolume"], ascending=[False, False]).head(40)
-
-    lines = []
-    for _, r in candidates.iterrows():
-        lines.append(
-            f"{r['Code']} {r['Name']}｜漲幅 {float(r['Change']):.2f}%｜量 {int(r['TradeVolume'])}｜長紅占比 {float(r['body_ratio']):.2f}"
+    required = [code_col, name_col, open_col, high_col, low_col, close_col, vol_col, chg_col]
+    if any(c is None for c in required):
+        raise RuntimeError(
+            "Cannot find required columns from TWSE response. "
+            "Please check 'TWSE columns' printed above and tell me."
         )
 
-    msg = "📈 台股掃描清單（上市｜骨架版）\n" + "\n".join(lines)
-    send_telegram(msg)
-
-
-if __name__ == "__main__":
-    try:
-        print("Starting scanner...")
-        print("BOT_TOKEN present:", bool(BOT_TOKEN))
-        print("CHAT_ID present:", bool(CHAT_ID))
-
-        run()
-
-        print("scanner finished")
-    except Exception as e:
-        print("scanner error:", repr(e))
-        raise
+    # 統一欄位名
+    df2 = df[[code_col, name_col, open_col, high_col, low_col, close_col, vol_col, chg_col]].copy()
+    df2.columns = ["Code", "Name", "Open", "High", "Low", "Close", "TradeVolu]()
