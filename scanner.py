@@ -3,248 +3,398 @@ import datetime as dt
 import requests
 import pandas as pd
 
+
+# =======================
+# ENV
+# =======================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "")
 
-TWSE_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+TWSE_DAY_ALL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
 
-# 用 0050 當作大盤 Proxy 來算 MA60（避免 ^TWII 資料不足）
+# =======================
+# STRATEGY PARAMS
+# =======================
 MARKET_PROXY = "0050"
+MA60_WINDOW = 60
 
-def send_telegram(msg: str):
+# Layer 2: 爆量長紅 (daily shape)  ✅ updated: 4% -> 3.5%
+MIN_CHG_PCT = 3.5
+MIN_BODY_RATIO = 0.60
+MIN_LOTS = 1500          # 張
+LOTS_UNIT = 1000         # FinMind Trading_Volume is shares = 張*1000
+
+# Layer 3: 真爆量 ✅ updated: 3x -> 2x
+VOL_MULT = 2.0           # today_vol > 2 * MA5 (exclude today)
+
+# Layer 4: 盤整突破 ✅ updated: 8% -> 10%
+CONSOL_DAYS = 20
+MAX_RANGE_PCT = 0.10     # 20d range <= 10%
+BREAKOUT_PCT = 0.01      # close >= high20*(1+1%)
+BREAKOUT_VOL_GT_MA5 = True
+
+# Sector strength: 5日主流族群
+SECTOR_LOOKBACK_DAYS = 5
+SECTOR_TOP_N = 5
+SECTOR_MIN_COUNT = 5
+SECTOR_UP_PCT = 2.0      # up >= 2% counts as "advancing"
+SECTOR_SCORE_UP_WEIGHT = 2.0
+SECTOR_MAIN_MIN_APPEAR = 3  # 5天內至少3天進Top5 => 主流族群
+
+
+# =======================
+# Utils
+# =======================
+def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-
+        print("Telegram env missing; skip sending.")
+        return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
+    print("Telegram status:", r.status_code)
+    if r.status_code != 200:
+        print("Telegram response:", r.text)
 
-    # Telegram 訊息長度限制：保守切段
-    chunk_size = 3500
-    parts = [msg[i:i+chunk_size] for i in range(0, len(msg), chunk_size)] or [""]
-
-    for part in parts:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": part}, timeout=20)
-        print("Telegram status:", r.status_code)
-        if r.status_code != 200:
-            print("Telegram response:", r.text)
-        r.raise_for_status()
-
-def today_tpe():
-    return (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
-
-def fmt(d):
-    return d.strftime("%Y-%m-%d")
 
 def finmind_get(dataset: str, data_id: str, start_date: str, end_date: str) -> pd.DataFrame:
     if not FINMIND_TOKEN:
         raise RuntimeError("Missing FINMIND_TOKEN")
-
-    r = requests.get(
-        FINMIND_URL,
-        headers={"Authorization": f"Bearer {FINMIND_TOKEN}"},
-        params={
-            "dataset": dataset,
-            "data_id": data_id,
-            "start_date": start_date,
-            "end_date": end_date
-        },
-        timeout=30
-    )
-    print("FinMind status:", r.status_code, "dataset:", dataset, "data_id:", data_id)
-    r.raise_for_status()
-
+    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
+    params = {
+        "dataset": dataset,
+        "data_id": data_id,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    r = requests.get(FINMIND_URL, headers=headers, params=params, timeout=30)
     j = r.json()
+    print(f"FinMind status: {j.get('status')} dataset: {dataset} data_id: {data_id}")
     if j.get("status") != 200:
-        raise RuntimeError(f"FinMind not ok: {j}")
-
+        return pd.DataFrame()
     return pd.DataFrame(j.get("data", []))
 
-def finmind_price(stock_id, days=500):
-    end = today_tpe()
-    start = end - dt.timedelta(days=days)
 
-    df = finmind_get("TaiwanStockPrice", stock_id, fmt(start), fmt(end))
+def get_price_history(stock_id: str, start: dt.date, end: dt.date) -> pd.DataFrame:
+    df = finmind_get("TaiwanStockPrice", stock_id, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ["open", "max", "min", "close", "Trading_Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "open", "max", "min", "close", "Trading_Volume"]).sort_values("date")
+    return df
+
+
+def market_above_ma60(asof: dt.date) -> tuple[bool, str]:
+    """Use 0050 close > MA60 on/asof date."""
+    start = asof - dt.timedelta(days=800)
+    df = get_price_history(MARKET_PROXY, start, asof)
+    if df.empty or len(df) < (MA60_WINDOW + 1):
+        return False, "Not enough 0050 history for MA60"
+    ma60 = df["close"].rolling(MA60_WINDOW).mean().iloc[-1]
+    close = float(df["close"].iloc[-1])
+    if pd.isna(ma60):
+        return False, "MA60 is NaN"
+    ok = close > float(ma60)
+    msg = f"{MARKET_PROXY} 收盤 {close:.2f} {'>' if ok else '<='} MA60 {float(ma60):.2f}"
+    return ok, msg
+
+
+# =======================
+# TWSE fetch (daily snapshot)
+# =======================
+def twse_fetch_day(date_yyyymmdd: str | None = None) -> pd.DataFrame:
+    """
+    Fetch TWSE STOCK_DAY_ALL.
+    - If date_yyyymmdd is None: latest available
+    - If date_yyyymmdd provided (YYYYMMDD): request that date
+    """
+    params = {"response": "json"}
+    if date_yyyymmdd:
+        params["date"] = date_yyyymmdd
+    r = requests.get(TWSE_DAY_ALL, params=params, timeout=30)
+    print("TWSE status:", r.status_code, "date:", date_yyyymmdd or "latest")
+    r.raise_for_status()
+    j = r.json()
+    if "data" not in j:
+        return pd.DataFrame()
+
+    if "fields" in j:
+        cols = j["fields"]
+        df = pd.DataFrame(j["data"], columns=cols)
+    else:
+        df = pd.DataFrame(j["data"])
+
+    rename_map = {
+        "日期": "Date",
+        "證券代號": "Code",
+        "證券名稱": "Name",
+        "成交股數": "TradeVolume",
+        "成交金額": "TradeValue",
+        "開盤價": "OpeningPrice",
+        "最高價": "HighestPrice",
+        "最低價": "LowestPrice",
+        "收盤價": "ClosingPrice",
+        "漲跌價差": "Change",
+        "成交筆數": "Transaction",
+    }
+    df = df.rename(columns=rename_map)
+
+    keep = [c for c in ["Date", "Code", "Name", "TradeVolume", "TradeValue",
+                        "OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice",
+                        "Change", "Transaction"] if c in df.columns]
+    df = df[keep].copy()
+
+    for c in ["TradeVolume", "TradeValue", "OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice"]:
+        if c in df.columns:
+            df[c] = (
+                df[c].astype(str)
+                .str.replace(",", "", regex=False)
+                .replace("--", None)
+            )
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["Code"] = df["Code"].astype(str).str.strip()
+    df = df[df["Code"].str.match(r"^\d{4}$", na=False)]
+    df = df.dropna(subset=["OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice", "TradeVolume"])
+
+    return df
+
+
+def find_recent_trade_days(n: int, max_lookback_days: int = 20) -> list[str]:
+    """
+    Find recent TWSE trade dates (YYYYMMDD) by probing backwards.
+    Returns list of date strings (most recent first).
+    """
+    out = []
+    d = dt.date.today()
+    tries = 0
+    while len(out) < n and tries < max_lookback_days:
+        yyyymmdd = d.strftime("%Y%m%d")
+        try:
+            df = twse_fetch_day(yyyymmdd)
+            if not df.empty:
+                out.append(yyyymmdd)
+        except Exception:
+            pass
+        d -= dt.timedelta(days=1)
+        tries += 1
+    return out
+
+
+# =======================
+# Sector mapping & 5-day main sectors
+# =======================
+def load_sector_map() -> dict:
+    info = finmind_get("TaiwanStockInfo", "all", "2000-01-01", dt.date.today().strftime("%Y-%m-%d"))
+    if info.empty:
+        return {}
+
+    candidates = ["industry_category", "industry", "category", "type"]
+    pick = None
+    for c in candidates:
+        if c in info.columns:
+            pick = c
+            break
+
+    if not pick:
+        non = [c for c in info.columns if c not in ["stock_id", "date"]]
+        pick = non[0] if non else None
+
+    sector_map = {}
+    if pick and "stock_id" in info.columns:
+        for _, r in info.iterrows():
+            sid = str(r["stock_id"]).strip()
+            sec = str(r.get(pick, "Unknown")).strip()
+            if sid and sid.isdigit():
+                sector_map[sid] = sec if sec else "Unknown"
+    return sector_map
+
+
+def sector_score_for_day(df_day: pd.DataFrame, sector_map: dict) -> pd.DataFrame:
+    """
+    Compute sector score for a single day using TWSE day snapshot.
+    score = avg_return + 2 * up_ratio(>=2%)
+    """
+    d = df_day.copy()
+    d["ret"] = (d["ClosingPrice"] - d["OpeningPrice"]) / d["OpeningPrice"] * 100.0
+    d["Sector"] = d["Code"].map(lambda x: sector_map.get(str(x), "Unknown"))
+
+    g = d.groupby("Sector", dropna=False)
+    out = []
+    for sec, sub in g:
+        if sec in [None, "", "nan"]:
+            sec = "Unknown"
+        sub = sub.dropna(subset=["ret"])
+        if len(sub) < SECTOR_MIN_COUNT:
+            continue
+        avg_ret = float(sub["ret"].mean())
+        up_ratio = float((sub["ret"] >= SECTOR_UP_PCT).mean())
+        score = avg_ret + SECTOR_SCORE_UP_WEIGHT * up_ratio
+        out.append((sec, score, avg_ret, up_ratio, len(sub)))
+
+    res = pd.DataFrame(out, columns=["Sector", "Score", "AvgRet", "UpRatio", "Count"])
+    res = res.sort_values("Score", ascending=False)
+    return res
+
+
+def compute_5day_main_sectors(sector_map: dict) -> tuple[set, list[str]]:
+    """
+    Main sectors = appear in daily TopN at least MIN_APPEAR times within last 5 trading days.
+    Returns (main_sectors_set, trade_days_list_most_recent_first)
+    """
+    trade_days = find_recent_trade_days(SECTOR_LOOKBACK_DAYS)
+    appear = {}
+
+    for yyyymmdd in trade_days:
+        df_day = twse_fetch_day(yyyymmdd)
+        if df_day.empty:
+            continue
+        score_df = sector_score_for_day(df_day, sector_map)
+        top = score_df.head(SECTOR_TOP_N)["Sector"].tolist()
+        for sec in top:
+            appear[sec] = appear.get(sec, 0) + 1
+
+    main = {sec for sec, cnt in appear.items() if cnt >= SECTOR_MAIN_MIN_APPEAR}
+    return main, trade_days
+
+
+# =======================
+# Main scan logic
+# =======================
+def load_today_candidates() -> pd.DataFrame:
+    df = twse_fetch_day(None)  # latest
     if df.empty:
         return df
 
-    df["date"] = pd.to_datetime(df["date"])
-    for c in ["open","max","min","close","Trading_Volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna().sort_values("date")
+    df["chg_pct"] = (df["ClosingPrice"] - df["OpeningPrice"]) / df["OpeningPrice"] * 100.0
+    df["range"] = df["HighestPrice"] - df["LowestPrice"]
+    df["body_ratio"] = (df["ClosingPrice"] - df["OpeningPrice"]) / df["range"]
+    df["lots"] = df["TradeVolume"] / 1000.0  # TWSE TradeVolume is shares
 
-def load_twse_snapshot():
-    r = requests.get(TWSE_ALL, timeout=30)
-    r.raise_for_status()
-    df = pd.DataFrame(r.json())
+    cond = (
+        (df["chg_pct"] >= MIN_CHG_PCT) &
+        (df["ClosingPrice"] > df["OpeningPrice"]) &
+        (df["body_ratio"] >= MIN_BODY_RATIO) &
+        (df["lots"] >= MIN_LOTS) &
+        (df["range"] > 0)
+    )
+    out = df.loc[cond, ["Code", "Name", "OpeningPrice", "HighestPrice", "LowestPrice",
+                        "ClosingPrice", "TradeVolume", "chg_pct"]].copy()
+    return out
 
-    df = df[["Code","Name","OpeningPrice","HighestPrice","LowestPrice","ClosingPrice","TradeVolume","Change"]].copy()
-    df.columns = ["Code","Name","Open","High","Low","Close","TradeVolume","Change"]
 
-    for c in ["Open","High","Low","Close","TradeVolume","Change"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna()
-    df["Code"] = df["Code"].astype(str)
-    df = df[df["Code"].str.len() == 4]
-    df = df[(df["High"] - df["Low"]) > 0]
-    df["body_ratio"] = (df["Close"] - df["Open"]) / (df["High"] - df["Low"])
-    return df
-
-def market_above_ma60():
-    df = finmind_price(MARKET_PROXY, 700)
-    if df.empty or len(df) < 80:
-        send_telegram(f"⚠️ 大盤濾網資料不足：{MARKET_PROXY} 日K不足以計算 MA60")
-        return False
-
-    ma60 = df["close"].rolling(60).mean()
-    last_close = float(df["close"].iloc[-1])
-    last_ma60 = float(ma60.iloc[-1])
-
-    if last_close <= last_ma60:
-        send_telegram(f"❌ 大盤未站上季線：{MARKET_PROXY} 收盤 {last_close:.2f} ≤ MA60 {last_ma60:.2f}")
-        return False
-
-    send_telegram(f"✅ 大盤站上季線：{MARKET_PROXY} 收盤 {last_close:.2f} > MA60 {last_ma60:.2f}")
-    return True
-
-def load_stock_info_sector_map() -> dict:
-    # 取得股票 -> 產業/族群 的對照表
-    end = today_tpe()
-    start = end - dt.timedelta(days=30)  # 給一點 buffer
-    info = finmind_get("TaiwanStockInfo", "all", fmt(start), fmt(end))
-    if info.empty or "stock_id" not in info.columns:
-        return {}
-
-    # 常見欄位：industry_category（若沒有就退而求其次）
-    sector_col = None
-    for c in ["industry_category", "industry", "category"]:
-        if c in info.columns:
-            sector_col = c
-            break
-
-    if not sector_col:
-        return {}
-
-    info = info.drop_duplicates("stock_id")
-    mp = info.set_index("stock_id")[sector_col].astype(str).to_dict()
-    return mp
-
-def compute_strong_sectors(snap: pd.DataFrame, sector_map: dict) -> tuple[list, pd.DataFrame]:
-    df = snap.copy()
-    df["Sector"] = df["Code"].map(sector_map).fillna("Unknown")
-
-    g = df.groupby("Sector").agg(
-        n=("Code", "count"),
-        avg_chg=("Change", "mean"),
-        breadth=("Change", lambda s: float((s >= 2).mean()))  # 上漲廣度
-    ).reset_index()
-
-    # 避免樣本太少的族群干擾
-    g = g[g["n"] >= 5].copy()
-
-    # score：平均漲幅 + 2*廣度（你可以之後再調權重）
-    g["score"] = g["avg_chg"] + 2.0 * g["breadth"]
-    g = g.sort_values("score", ascending=False)
-
-    top5 = g[g["Sector"] != "Unknown"].head(5)["Sector"].tolist()
-    return top5, g.head(10)
-
-def check_stock(code, snap_row):
-    hist = finmind_price(code, 700)
-    if hist.empty or len(hist) < 30:
+def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
+    """
+    Use FinMind history to validate:
+    - vol_mult > VOL_MULT x MA5 (exclude today)
+    - consolidation breakout on prev CONSOL_DAYS
+    """
+    end = dt.date.today()
+    start = end - dt.timedelta(days=500)
+    hist = get_price_history(stock_id, start, end)
+    if hist.empty:
         return None
 
-    v_today = float(snap_row["TradeVolume"])
-    o = float(snap_row["Open"])
-    c = float(snap_row["Close"])
-    chg = float(snap_row["Change"])
-    body_ratio = float(snap_row["body_ratio"])
+    c = float(today_row["ClosingPrice"])
+    v_today = float(today_row["TradeVolume"])  # shares
 
-    lots1500 = 1500 * 1000
-
-    vol = hist["Trading_Volume"].astype(float)
-    ma5 = float(vol.iloc[-6:-1].mean())
-
-    # 爆量長紅（含 3×5 日均量）
-    if not (v_today >= lots1500 and chg >= 4 and c > o and body_ratio >= 0.6 and v_today > 3 * ma5):
+    if len(hist) < (CONSOL_DAYS + 6):
         return None
 
-    # 盤整突破（前 20 日）
-    prev20 = hist.iloc[-21:-1]
-    if len(prev20) < 20:
+    base = hist.iloc[:-1].copy()
+    if len(base) < (CONSOL_DAYS + 6):
         return None
 
-    hi = float(prev20["max"].max())
-    lo = float(prev20["min"].min())
-    width = (hi - lo) / lo if lo > 0 else 999
-
-    if width > 0.08:
+    ma5 = float(base["Trading_Volume"].iloc[-5:].mean())
+    vol_mult = (v_today / ma5) if ma5 > 0 else 0.0
+    if not (v_today > VOL_MULT * ma5):
         return None
 
-    if not (c >= hi * 1.01 and v_today > ma5):
+    prev20 = base.iloc[-CONSOL_DAYS:]
+    high20 = float(prev20["max"].max())
+    low20 = float(prev20["min"].min())
+    width = (high20 - low20) / low20 if low20 > 0 else 999.0
+    if width > MAX_RANGE_PCT:
         return None
+
+    if not (c >= high20 * (1.0 + BREAKOUT_PCT)):
+        return None
+
+    if BREAKOUT_VOL_GT_MA5 and not (v_today > ma5):
+        return None
+
+    break_pct = (c / high20 - 1.0) if high20 > 0 else 0.0
 
     return {
-        "chg": chg,
-        "vol_mult": (v_today / ma5) if ma5 > 0 else None,
-        "break_pct": (c / hi - 1.0),
+        "Code": stock_id,
+        "Name": str(today_row["Name"]),
+        "chg": float(today_row["chg_pct"]),
+        "vol_mult": float(vol_mult),
+        "lots": float(v_today / LOTS_UNIT),
+        "range20_pct": float(width),
+        "break_pct": float(break_pct),
     }
 
+
 def run():
-    if not market_above_ma60():
+    print("Starting scanner")
+
+    ok, msg = market_above_ma60(dt.date.today())
+    send_telegram(("✅ 大盤站上季線：" if ok else "❌ 大盤未站上季線：") + msg)
+    if not ok:
         return
 
-    snap = load_twse_snapshot()
+    sector_map = load_sector_map()
+    main_sectors, trade_days = compute_5day_main_sectors(sector_map)
 
-    # 先做族群判定（用今日全市場快照）
-    sector_map = load_stock_info_sector_map()
-    strong_sectors, _ = compute_strong_sectors(snap, sector_map)
+    if main_sectors:
+        send_telegram("🔥🔥 5日主流族群（近5日Top5入榜≥3日）：\n" + "、".join(sorted(main_sectors)))
+    else:
+        send_telegram("ℹ️ 5日主流族群：資料不足或無法辨識（main_sectors 為空）")
 
-    if strong_sectors:
-        send_telegram("🔥 今日強勢族群（Top5）： " + "、".join(strong_sectors))
-
-    # 初篩（減少 FinMind 查詢量）
-    pre = snap[
-        (snap["TradeVolume"] >= 1500 * 1000) &
-        (snap["Change"] >= 4) &
-        (snap["Close"] > snap["Open"]) &
-        (snap["body_ratio"] >= 0.6)
-    ].copy()
+    cand = load_today_candidates()
+    if cand.empty:
+        send_telegram("✅ 今日無符合『爆量長紅』初篩個股")
+        return
 
     hits = []
-    for _, r in pre.iterrows():
-        res = check_stock(r["Code"], r)
+    for _, r in cand.iterrows():
+        sid = str(r["Code"])
+        res = check_one_stock(sid, r)
         if res:
-            sector = sector_map.get(r["Code"], "Unknown")
-            is_strong = sector in strong_sectors
-            hits.append({
-                "Code": r["Code"],
-                "Name": r["Name"],
-                "Sector": sector,
-                "is_strong": is_strong,
-                **res
-            })
+            res["Sector"] = sector_map.get(sid, "Unknown")
+            hits.append(res)
 
     if not hits:
-        send_telegram("✅ 今日無符合『爆量長紅＋盤整突破（含3×5日均量）』個股")
+        send_telegram("✅ 今日無符合『爆量長紅＋盤整突破（含2×5日均量）』個股")
         return
 
-    df = pd.DataFrame(hits)
-    df = df.sort_values(["is_strong", "chg", "vol_mult"], ascending=[False, False, False]).head(30)
+    def is_main(sec: str) -> int:
+        return 1 if sec in main_sectors else 0
+
+    hits = sorted(
+        hits,
+        key=lambda x: (is_main(x["Sector"]), x["chg"], x["vol_mult"]),
+        reverse=True
+    )
 
     lines = []
-    for _, x in df.iterrows():
-        tag = "🔥" if x["is_strong"] else "•"
+    for x in hits[:30]:
+        tag = "🔥🔥" if x["Sector"] in main_sectors else "•"
         lines.append(
-            f"{tag}{x['Code']} {x['Name']}｜{x['chg']:.1f}%｜量倍 {x['vol_mult']:.2f}｜突破 {x['break_pct']*100:.1f}%｜{x['Sector']}"
+            f"{tag}{x['Code']} {x['Name']}｜{x['chg']:.1f}%｜量倍 {x['vol_mult']:.2f}x｜突破 {x['break_pct']*100:.1f}%｜{x['Sector']}"
         )
 
-    send_telegram("📈 台股突破清單（強勢族群優先）\n" + "\n".join(lines))
+    send_telegram("📈 台股突破清單（5日主流族群優先）\n" + "\n".join(lines))
+
 
 if __name__ == "__main__":
     try:
         run()
+        print("Scanner finished")
     except Exception as e:
         print("Scanner error:", repr(e))
         raise
