@@ -33,5 +33,60 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+              - name: Dispatch to backtest tracker
+        env:
+          PAT_BACKTEST: ${{ secrets.PAT_BACKTEST }}
         run: |
-          python scanner.py
+          if [ ! -f scanner_result.json ]; then
+            echo "scanner_result.json not found, skip tracker dispatch"
+            exit 0
+          fi
+
+          echo "=== scanner_result.json ==="
+          cat scanner_result.json
+          echo "==========================="
+
+          python - << 'PY'
+          import json, os, subprocess, sys
+
+          with open("scanner_result.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          stocks = data.get("stocks", [])
+          signal_date = data.get("signal_date", "")
+
+          if not stocks:
+              print("No stocks selected → skip tracker dispatch")
+              sys.exit(0)
+
+          if not signal_date:
+              print("Missing signal_date → skip tracker dispatch")
+              sys.exit(0)
+
+          pat = os.environ.get("PAT_BACKTEST")
+          if not pat:
+              print("Missing PAT_BACKTEST secret")
+              sys.exit(1)
+
+          payload = {
+              "event_type": "run-tracker",
+              "client_payload": {
+                  "input_stocks": ",".join(stocks),
+                  "signal_date": signal_date
+              }
+          }
+
+          print("Dispatch payload:", payload)
+
+          cmd = [
+              "curl", "-sS", "-X", "POST",
+              "-H", f"Authorization: token {pat}",
+              "-H", "Accept: application/vnd.github+json",
+              "https://api.github.com/repos/clarencelin1226-bit/clarence-stock-backtest/dispatches",
+              "-d", json.dumps(payload)
+          ]
+
+          subprocess.check_call(cmd)
+          print("Tracker dispatch sent successfully.")
+          PY
+
