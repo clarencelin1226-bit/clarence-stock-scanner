@@ -398,3 +398,45 @@ if __name__ == "__main__":
     except Exception as e:
         print("Scanner error:", repr(e))
         raise
+# =====================================================
+# AUTO EXPORT SCANNER RESULT FOR GOOGLE SHEET TRACKER
+# （此區塊只負責「輸出結果」，不影響任何選股或通知）
+# =====================================================
+
+import json
+
+try:
+    # 假設你原本 scanner 已經有：
+    # - picks: 篩選後的股票清單
+    # - signal_date: 本次使用的收盤日期（YYYY-MM-DD）
+
+    export_stocks = []
+
+    for p in picks:
+        # 常見格式 1：dict，例如 {"Code": "1809", ...}
+        if isinstance(p, dict) and "Code" in p:
+            export_stocks.append(str(p["Code"]))
+        # 常見格式 2：tuple / list，例如 ("1809", "晶豪科", ...)
+        elif isinstance(p, (list, tuple)) and len(p) > 0:
+            export_stocks.append(str(p[0]))
+        # 常見格式 3：直接是字串 "1809"
+        elif isinstance(p, str):
+            export_stocks.append(p)
+
+    export_stocks = [s.strip() for s in export_stocks if s.strip()]
+
+    export_data = {
+        "signal_date": str(signal_date),
+        "stocks": export_stocks
+    }
+
+    with open("scanner_result.json", "w", encoding="utf-8") as f:
+        json.dump(export_data, f, ensure_ascii=False)
+
+    print("[SCANNER_RESULT_JSON]", json.dumps(export_data, ensure_ascii=False))
+
+except Exception as e:
+    # 就算這段失敗，也不影響 scanner 主流程
+    print("[SCANNER_RESULT_JSON_ERROR]", repr(e))
+
+# =================== END EXPORT ======================
