@@ -105,83 +105,106 @@ def market_above_ma60(asof: dt.date) -> tuple[bool, str]:
 # =======================
 # TWSE fetch (daily snapshot)
 # =======================
-def twse_fetch_day(date_yyyymmdd: str | None = None) -> pd.DataFrame:
+def twse_fetch_day(date_yyyymmdd: str | None = None, max_retries: int = 3) -> pd.DataFrame:
     """
     Fetch TWSE STOCK_DAY_ALL.
     - If date_yyyymmdd is None: latest available
     - If date_yyyymmdd provided (YYYYMMDD): request that date
+
+    Robustness:
+    - Retry on 5xx / transient network errors
+    - Never raise; on failure returns empty DataFrame
     """
     params = {"response": "json"}
     if date_yyyymmdd:
         params["date"] = date_yyyymmdd
-    r = requests.get(TWSE_DAY_ALL, params=params, timeout=30)
-    print("TWSE status:", r.status_code, "date:", date_yyyymmdd or "latest")
-    r.raise_for_status()
-    j = r.json()
-    if "data" not in j:
-        return pd.DataFrame()
 
-    if "fields" in j:
-        cols = j["fields"]
-        df = pd.DataFrame(j["data"], columns=cols)
-    else:
-        df = pd.DataFrame(j["data"])
-
-    rename_map = {
-        "日期": "Date",
-        "證券代號": "Code",
-        "證券名稱": "Name",
-        "成交股數": "TradeVolume",
-        "成交金額": "TradeValue",
-        "開盤價": "OpeningPrice",
-        "最高價": "HighestPrice",
-        "最低價": "LowestPrice",
-        "收盤價": "ClosingPrice",
-        "漲跌價差": "Change",
-        "成交筆數": "Transaction",
-    }
-    df = df.rename(columns=rename_map)
-
-    keep = [c for c in ["Date", "Code", "Name", "TradeVolume", "TradeValue",
-                        "OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice",
-                        "Change", "Transaction"] if c in df.columns]
-    df = df[keep].copy()
-
-    for c in ["TradeVolume", "TradeValue", "OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice"]:
-        if c in df.columns:
-            df[c] = (
-                df[c].astype(str)
-                .str.replace(",", "", regex=False)
-                .replace("--", None)
-            )
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["Code"] = df["Code"].astype(str).str.strip()
-    df = df[df["Code"].str.match(r"^\d{4}$", na=False)]
-    df = df.dropna(subset=["OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice", "TradeVolume"])
-
-    return df
-
-
-def find_recent_trade_days(n: int, max_lookback_days: int = 20) -> list[str]:
-    """
-    Find recent TWSE trade dates (YYYYMMDD) by probing backwards.
-    Returns list of date strings (most recent first).
-    """
-    out = []
-    d = dt.date.today()
-    tries = 0
-    while len(out) < n and tries < max_lookback_days:
-        yyyymmdd = d.strftime("%Y%m%d")
+    last_err = None
+    for attempt in range(1, max_retries + 1):
         try:
-            df = twse_fetch_day(yyyymmdd)
-            if not df.empty:
-                out.append(yyyymmdd)
-        except Exception:
-            pass
-        d -= dt.timedelta(days=1)
-        tries += 1
-    return out
+            r = requests.get(TWSE_DAY_ALL, params=params, timeout=30)
+            print("TWSE status:", r.status_code, "date:", date_yyyymmdd or "latest", "attempt:", attempt)
+
+            # 2xx OK
+            if 200 <= r.status_code < 300:
+                j = r.json()
+
+                # 有時候 TWSE 回傳 stat != OK 或缺 data
+                if isinstance(j, dict) and j.get("stat") not in (None, "OK"):
+                    print("[TWSE] stat not OK:", j.get("stat"), "date:", date_yyyymmdd or "latest")
+                    return pd.DataFrame()
+
+                if "data" not in j:
+                    return pd.DataFrame()
+
+                if "fields" in j:
+                    cols = j["fields"]
+                    df = pd.DataFrame(j["data"], columns=cols)
+                else:
+                    df = pd.DataFrame(j["data"])
+
+                rename_map = {
+                    "日期": "Date",
+                    "證券代號": "Code",
+                    "證券名稱": "Name",
+                    "成交股數": "TradeVolume",
+                    "成交金額": "TradeValue",
+                    "開盤價": "OpeningPrice",
+                    "最高價": "HighestPrice",
+                    "最低價": "LowestPrice",
+                    "收盤價": "ClosingPrice",
+                    "漲跌價差": "Change",
+                    "成交筆數": "Transaction",
+                }
+                df = df.rename(columns=rename_map)
+
+                keep = [c for c in ["Date", "Code", "Name", "TradeVolume", "TradeValue",
+                                    "OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice",
+                                    "Change", "Transaction"] if c in df.columns]
+                df = df[keep].copy()
+
+                for c in ["TradeVolume", "TradeValue", "OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice"]:
+                    if c in df.columns:
+                        df[c] = (
+                            df[c].astype(str)
+                            .str.replace(",", "", regex=False)
+                            .replace("--", None)
+                        )
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+                if "Code" in df.columns:
+                    df["Code"] = df["Code"].astype(str).str.strip()
+                    df = df[df["Code"].str.match(r"^\d{4}$", na=False)]
+
+                # 沒資料就回空
+                if df.empty:
+                    return pd.DataFrame()
+
+                # 過濾有效列
+                need_cols = ["OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice", "TradeVolume"]
+                existing_need = [c for c in need_cols if c in df.columns]
+                if existing_need:
+                    df = df.dropna(subset=existing_need)
+
+                return df
+
+            # 4xx（通常是參數/日期問題）直接放棄，不重試
+            if 400 <= r.status_code < 500:
+                print("[TWSE] client error, skip:", r.status_code, "date:", date_yyyymmdd or "latest")
+                return pd.DataFrame()
+
+            # 5xx：重試
+            last_err = RuntimeError(f"TWSE {r.status_code}")
+
+        except Exception as e:
+            last_err = e
+
+        # 簡單 backoff
+        time.sleep(0.8 * attempt)
+
+    print("[TWSE] failed after retries:", repr(last_err), "date:", date_yyyymmdd or "latest")
+    return pd.DataFrame()
+
 
 
 # =======================
