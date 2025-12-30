@@ -415,54 +415,48 @@ def run():
         send_telegram("✅ 今日無符合『爆量長紅＋盤整突破（含2×5日均量）』個股")
         return
 
-    def is_main(sec: str) -> int:
+        def is_main(sec: str) -> int:
         return 1 if sec in main_sectors else 0
 
     hits = sorted(
         hits,
-        key=lambda x: (is_main(x["Sector"]), x["chg"], x["vol_mult"]),
+        key=lambda x: (is_main(x.get("Sector", "")), x.get("chg", 0), x.get("vol_mult", 0)),
         reverse=True
     )
 
     lines = []
     for x in hits[:30]:
-        tag = "🔥🔥" if x["Sector"] in main_sectors else "•"
+        sec = x.get("Sector", "Unknown")
+        tag = "🔥🔥" if sec in main_sectors else "•"
         lines.append(
-            f"{tag}{x['Code']} {x['Name']}｜{x['chg']:.1f}%｜量倍 {x['vol_mult']:.2f}x｜突破 {x['break_pct']*100:.1f}%｜{x['Sector']}"
+            f"{tag}{x['Code']} {x['Name']}｜{x['chg']:.1f}%｜量倍 {x['vol_mult']:.2f}x｜突破 {x['break_pct']*100:.1f}%｜{sec}"
         )
 
     send_telegram("📈 台股突破清單（5日主流族群優先）\n" + "\n".join(lines))
 
-
-if __name__ == "__main__":
+    # =========================
+    # EXPORT SCANNER RESULT FOR TRACKER
+    # =========================
     try:
-        run()
-        print("Scanner finished")
+        import json
+
+        export_stocks = [str(x["Code"]) for x in hits]
+
+        # 用 trade_days[0] 當作訊號日（YYYYMMDD → YYYY-MM-DD）
+        if trade_days and isinstance(trade_days[0], str) and len(trade_days[0]) == 8:
+            signal_date = f"{trade_days[0][0:4]}-{trade_days[0][4:6]}-{trade_days[0][6:8]}"
+        else:
+            signal_date = dt.date.today().strftime("%Y-%m-%d")
+
+        export_data = {
+            "signal_date": signal_date,
+            "stocks": export_stocks
+        }
+
+        with open("scanner_result.json", "w", encoding="utf-8") as f:
+            json.dump(export_data, f, ensure_ascii=False)
+
+        print("[SCANNER_RESULT_JSON]", json.dumps(export_data, ensure_ascii=False))
+
     except Exception as e:
-        print("Scanner error:", repr(e))
-        raise
-send_telegram("📈 台股突破清單（5日主流族群優先）\n" + "\n".join(lines))
-
-# =========================
-# EXPORT SCANNER RESULT
-# =========================
-try:
-    import json
-
-    export_stocks = [str(x["Code"]) for x in hits]
-
-    # 以「最近一個交易日」作為 signal_date
-    signal_date = trade_days[0] if trade_days else dt.date.today().strftime("%Y-%m-%d")
-
-    export_data = {
-        "signal_date": signal_date,
-        "stocks": export_stocks
-    }
-
-    with open("scanner_result.json", "w", encoding="utf-8") as f:
-        json.dump(export_data, f, ensure_ascii=False)
-
-    print("[SCANNER_RESULT_JSON]", json.dumps(export_data, ensure_ascii=False))
-
-except Exception as e:
-    print("[SCANNER_RESULT_JSON_ERROR]", repr(e))
+        print("[SCANNER_RESULT_JSON_ERROR]", repr(e))
