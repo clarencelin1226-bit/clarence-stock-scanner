@@ -416,7 +416,7 @@ def run():
         return
 
         def is_main(sec: str) -> int:
-        return 1 if sec in main_sectors else 0
+            return 1 if sec in main_sectors else 0
 
     hits = sorted(
         hits,
