@@ -19,9 +19,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-- name: Run scanner
-  run: |
-    python scanner.py
 
       - name: Install dependencies
         run: |
@@ -33,7 +30,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-              - name: Dispatch to backtest tracker
+        run: |
+          python scanner.py
+
+      - name: Dispatch to backtest tracker
         env:
           PAT_BACKTEST: ${{ secrets.PAT_BACKTEST }}
         run: |
@@ -56,11 +56,11 @@ jobs:
           signal_date = data.get("signal_date", "")
 
           if not stocks:
-              print("No stocks selected → skip tracker dispatch")
+              print("No stocks selected -> skip tracker dispatch")
               sys.exit(0)
 
           if not signal_date:
-              print("Missing signal_date → skip tracker dispatch")
+              print("Missing signal_date -> skip tracker dispatch")
               sys.exit(0)
 
           pat = os.environ.get("PAT_BACKTEST")
@@ -89,4 +89,3 @@ jobs:
           subprocess.check_call(cmd)
           print("Tracker dispatch sent successfully.")
           PY
-
