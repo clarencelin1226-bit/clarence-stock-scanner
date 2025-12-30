@@ -205,6 +205,26 @@ def twse_fetch_day(date_yyyymmdd: str | None = None, max_retries: int = 3) -> pd
     print("[TWSE] failed after retries:", repr(last_err), "date:", date_yyyymmdd or "latest")
     return pd.DataFrame()
 
+def find_recent_trade_days(n: int, max_lookback_days: int = 30) -> list[str]:
+    """
+    Find recent TWSE trade dates (YYYYMMDD) by probing backwards.
+    Returns list of date strings (most recent first).
+    """
+    out: list[str] = []
+    d = dt.date.today()
+    tries = 0
+
+    while len(out) < n and tries < max_lookback_days:
+        yyyymmdd = d.strftime("%Y%m%d")
+
+        df = twse_fetch_day(yyyymmdd)
+        if df is not None and not df.empty:
+            out.append(yyyymmdd)
+
+        d -= dt.timedelta(days=1)
+        tries += 1
+
+    return out
 
 
 # =======================
