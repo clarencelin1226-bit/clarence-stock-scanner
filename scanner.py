@@ -385,13 +385,31 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
 def run():
     print("Starting scanner")
 
+    # -------------------------
+    # Helper: always export json
+    # -------------------------
+    def export_scanner_result(stocks: list[str], signal_date: str):
+        import json
+        data = {"signal_date": signal_date, "stocks": stocks}
+        with open("scanner_result.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print("[SCANNER_RESULT_JSON]", json.dumps(data, ensure_ascii=False))
+
+    # Default signal date = today (will be updated if we have trade_days)
+    signal_date = dt.date.today().strftime("%Y-%m-%d")
+
     ok, msg = market_above_ma60(dt.date.today())
     send_telegram(("✅ 大盤站上季線：" if ok else "❌ 大盤未站上季線：") + msg)
     if not ok:
+        export_scanner_result([], signal_date)
         return
 
     sector_map = load_sector_map()
     main_sectors, trade_days = compute_5day_main_sectors(sector_map)
+
+    # Update signal_date from trade_days[0] if available (YYYYMMDD -> YYYY-MM-DD)
+    if trade_days and isinstance(trade_days[0], str) and len(trade_days[0]) == 8:
+        signal_date = f"{trade_days[0][0:4]}-{trade_days[0][4:6]}-{trade_days[0][6:8]}"
 
     if main_sectors:
         send_telegram("🔥🔥 5日主流族群（近5日Top5入榜≥3日）：\n" + "、".join(sorted(main_sectors)))
@@ -401,6 +419,7 @@ def run():
     cand = load_today_candidates()
     if cand.empty:
         send_telegram("✅ 今日無符合『爆量長紅』初篩個股")
+        export_scanner_result([], signal_date)
         return
 
     hits = []
@@ -413,10 +432,11 @@ def run():
 
     if not hits:
         send_telegram("✅ 今日無符合『爆量長紅＋盤整突破（含2×5日均量）』個股")
+        export_scanner_result([], signal_date)
         return
 
-        def is_main(sec: str) -> int:
-            return 1 if sec in main_sectors else 0
+    def is_main(sec: str) -> int:
+        return 1 if sec in main_sectors else 0
 
     hits = sorted(
         hits,
@@ -434,29 +454,5 @@ def run():
 
     send_telegram("📈 台股突破清單（5日主流族群優先）\n" + "\n".join(lines))
 
-    # =========================
-    # EXPORT SCANNER RESULT FOR TRACKER
-    # =========================
-    try:
-        import json
-
-        export_stocks = [str(x["Code"]) for x in hits]
-
-        # 用 trade_days[0] 當作訊號日（YYYYMMDD → YYYY-MM-DD）
-        if trade_days and isinstance(trade_days[0], str) and len(trade_days[0]) == 8:
-            signal_date = f"{trade_days[0][0:4]}-{trade_days[0][4:6]}-{trade_days[0][6:8]}"
-        else:
-            signal_date = dt.date.today().strftime("%Y-%m-%d")
-
-        export_data = {
-            "signal_date": signal_date,
-            "stocks": export_stocks
-        }
-
-        with open("scanner_result.json", "w", encoding="utf-8") as f:
-            json.dump(export_data, f, ensure_ascii=False)
-
-        print("[SCANNER_RESULT_JSON]", json.dumps(export_data, ensure_ascii=False))
-
-    except Exception as e:
-        print("[SCANNER_RESULT_JSON_ERROR]", repr(e))
+    # Export final hits for tracker dispatch
+    export_scanner_result([str(x["Code"]) for x in hits], signal_date)
