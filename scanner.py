@@ -459,4 +459,12 @@ def run():
     # Export final hits for tracker dispatch
     export_scanner_result([str(x["Code"]) for x in hits], signal_date)
     print("=== EOF reached ===")
+    # =========================
+# Program entry point
+# =========================
+if __name__ == "__main__":
+    print("=== SCANNER ENTRY ===")
+    run()
+    print("=== SCANNER EXIT ===")
+
 
