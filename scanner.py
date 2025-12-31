@@ -1,3 +1,5 @@
+print("=== SCANNER VERSION: 2025-12-31 v1 ===")
+
 import os
 import datetime as dt
 import requests
