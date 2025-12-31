@@ -458,3 +458,5 @@ def run():
 
     # Export final hits for tracker dispatch
     export_scanner_result([str(x["Code"]) for x in hits], signal_date)
+    print("=== EOF reached ===")
+
