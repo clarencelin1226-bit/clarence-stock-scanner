@@ -465,7 +465,11 @@ def run():
 # =========================
 if __name__ == "__main__":
     print("=== SCANNER ENTRY ===")
-    run()
-    print("=== SCANNER EXIT ===")
+    try:
+        run()
+        print("=== SCANNER EXIT (OK) ===")
+    except Exception as e:
+        print("=== SCANNER EXIT (ERROR) ===", repr(e))
+        raise
 
 
