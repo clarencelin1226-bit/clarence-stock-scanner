@@ -32,6 +32,17 @@ jobs:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
           python scanner.py
+          
+      - name: Debug files after scanner
+        run: |
+          echo "=== pwd ==="
+          pwd
+          echo "=== ls -la ==="
+          ls -la
+          echo "=== find scanner_result.json ==="
+          find . -maxdepth 3 -name "scanner_result.json" -print || true
+          echo "=== cat scanner_result.json ==="
+          cat scanner_result.json || true
 
       - name: Dispatch to backtest tracker
         env:
