@@ -337,6 +337,7 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
     Use FinMind history to validate:
     - vol_mult > VOL_MULT x MA5 (exclude today)
     - consolidation breakout on prev CONSOL_DAYS
+    - (NEW) return MA20/MA60 context for A/B tagging
     """
     end = dt.date.today()
     start = end - dt.timedelta(days=500)
@@ -344,21 +345,24 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
     if hist.empty:
         return None
 
-    c = float(today_row["ClosingPrice"])
-    v_today = float(today_row["TradeVolume"])  # shares
+    c = float(today_row["ClosingPrice"])       # today close (TWSE)
+    v_today = float(today_row["TradeVolume"])  # shares (TWSE)
 
     if len(hist) < (CONSOL_DAYS + 6):
         return None
 
+    # EXCLUDE today in history for indicators (avoid look-ahead)
     base = hist.iloc[:-1].copy()
     if len(base) < (CONSOL_DAYS + 6):
         return None
 
+    # ====== Volume check (MA5 exclude today) ======
     ma5 = float(base["Trading_Volume"].iloc[-5:].mean())
     vol_mult = (v_today / ma5) if ma5 > 0 else 0.0
     if not (v_today > VOL_MULT * ma5):
         return None
 
+    # ====== Consolidation breakout check ======
     prev20 = base.iloc[-CONSOL_DAYS:]
     high20 = float(prev20["max"].max())
     low20 = float(prev20["min"].min())
@@ -374,6 +378,16 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
 
     break_pct = (c / high20 - 1.0) if high20 > 0 else 0.0
 
+    # =========================
+    # NEW: MA20 / MA60 (use FinMind close, EXCLUDE today)
+    # =========================
+    ma20 = None
+    ma60 = None
+    if len(base) >= 20:
+        ma20 = float(base["close"].rolling(20).mean().iloc[-1])
+    if len(base) >= 60:
+        ma60 = float(base["close"].rolling(60).mean().iloc[-1])
+
     return {
         "Code": stock_id,
         "Name": str(today_row["Name"]),
@@ -382,7 +396,13 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
         "lots": float(v_today / LOTS_UNIT),
         "range20_pct": float(width),
         "break_pct": float(break_pct),
+
+        # NEW
+        "close": float(c),
+        "ma20": ma20,
+        "ma60": ma60,
     }
+
 
 
 def run():
@@ -391,9 +411,14 @@ def run():
     # -------------------------
     # Helper: always export json
     # -------------------------
-    def export_scanner_result(stocks: list[str], signal_date: str):
+    def export_scanner_result(stocks: list[str], signal_date: str, stocks_a: list[str] | None = None, stocks_b: list[str] | None = None):
         import json
-        data = {"signal_date": signal_date, "stocks": stocks}
+        data = {
+            "signal_date": signal_date,
+            "stocks": stocks,          # keep for tracker compatibility
+            "stocks_a": stocks_a or [],
+            "stocks_b": stocks_b or [],
+        }
         with open("scanner_result.json", "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         print("[SCANNER_RESULT_JSON]", json.dumps(data, ensure_ascii=False))
@@ -404,7 +429,7 @@ def run():
     ok, msg = market_above_ma60(dt.date.today())
     send_telegram(("✅ 大盤站上季線：" if ok else "❌ 大盤未站上季線：") + msg)
     if not ok:
-        export_scanner_result([], signal_date)
+        export_scanner_result([], signal_date, [], [])
         return
 
     sector_map = load_sector_map()
@@ -422,7 +447,7 @@ def run():
     cand = load_today_candidates()
     if cand.empty:
         send_telegram("✅ 今日無符合『爆量長紅』初篩個股")
-        export_scanner_result([], signal_date)
+        export_scanner_result([], signal_date, [], [])
         return
 
     hits = []
@@ -435,30 +460,70 @@ def run():
 
     if not hits:
         send_telegram("✅ 今日無符合『爆量長紅＋盤整突破（含2×5日均量）』個股")
-        export_scanner_result([], signal_date)
+        export_scanner_result([], signal_date, [], [])
         return
 
+    # ---- helper for sorting
     def is_main(sec: str) -> int:
         return 1 if sec in main_sectors else 0
 
-    hits = sorted(
-        hits,
-        key=lambda x: (is_main(x.get("Sector", "")), x.get("chg", 0), x.get("vol_mult", 0)),
-        reverse=True
+    # ---- NEW: classify A/B
+    # A: close >= MA20 AND MA20 > MA60  (both MA exist)
+    hitsA = []
+    hitsB = []
+    for x in hits:
+        close = x.get("close", None)
+        ma20 = x.get("ma20", None)
+        ma60 = x.get("ma60", None)
+        if (close is not None) and (ma20 is not None) and (ma60 is not None) and (close >= ma20) and (ma20 > ma60):
+            x["signal_type"] = "A"
+            hitsA.append(x)
+        else:
+            x["signal_type"] = "B"
+            hitsB.append(x)
+
+    # ---- keep your original priority logic, but apply within A then B
+    def sort_key(x):
+        return (is_main(x.get("Sector", "")), x.get("chg", 0), x.get("vol_mult", 0))
+
+    hitsA = sorted(hitsA, key=sort_key, reverse=True)
+    hitsB = sorted(hitsB, key=sort_key, reverse=True)
+
+    # ---- Telegram output
+    def build_lines(xs, title):
+        if not xs:
+            return None
+        lines = []
+        for x in xs[:30]:
+            sec = x.get("Sector", "Unknown")
+            tag = "🔥🔥" if sec in main_sectors else "•"
+            ma20 = x.get("ma20", None)
+            ma60 = x.get("ma60", None)
+
+            ma_txt = ""
+            if (ma20 is not None) and (ma60 is not None):
+                ma_txt = f"｜MA20 {ma20:.2f}｜MA60 {ma60:.2f}"
+
+            lines.append(
+                f"{tag}{x['Code']} {x['Name']}｜{x['chg']:.1f}%｜量倍 {x['vol_mult']:.2f}x｜突破 {x['break_pct']*100:.1f}%｜{sec}{ma_txt}"
+            )
+        return f"{title}\n" + "\n".join(lines)
+
+    msgA = build_lines(hitsA, "🅰️ 訊號A（多頭排列 + 站上MA20）")
+    msgB = build_lines(hitsB, "🅱️ 訊號B（符合原條件，但未達A）")
+
+    if msgA:
+        send_telegram(msgA)
+    if msgB:
+        send_telegram(msgB)
+
+    # ---- Export json for tracker dispatch (keep stocks = all)
+    export_scanner_result(
+        stocks=[str(x["Code"]) for x in (hitsA + hitsB)],
+        signal_date=signal_date,
+        stocks_a=[str(x["Code"]) for x in hitsA],
+        stocks_b=[str(x["Code"]) for x in hitsB],
     )
-
-    lines = []
-    for x in hits[:30]:
-        sec = x.get("Sector", "Unknown")
-        tag = "🔥🔥" if sec in main_sectors else "•"
-        lines.append(
-            f"{tag}{x['Code']} {x['Name']}｜{x['chg']:.1f}%｜量倍 {x['vol_mult']:.2f}x｜突破 {x['break_pct']*100:.1f}%｜{sec}"
-        )
-
-    send_telegram("📈 台股突破清單（5日主流族群優先）\n" + "\n".join(lines))
-
-    # Export final hits for tracker dispatch
-    export_scanner_result([str(x["Code"]) for x in hits], signal_date)
     print("=== EOF reached ===")
     # =========================
 # Program entry point
