@@ -337,10 +337,28 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
     Use FinMind history to validate:
     - vol_mult > VOL_MULT x MA5 (exclude today)
     - consolidation breakout on prev CONSOL_DAYS
+    - pct change 기준: (close - prev_close) / prev_close  (收-昨收)
     - (NEW) return MA20/MA60 context for A/B tagging
     """
-    end = dt.date.today()
+
+    # -------------------------
+    # 1) 用 today_row 的交易日當 asof，避免休市/假日 dt.date.today() 對不上
+    # -------------------------
+    asof = dt.date.today()
+    try:
+        if "Date" in today_row:
+            ds = str(today_row["Date"]).strip()
+            # 可能是 "20260105" 或 "2026-01-05"
+            if ds.isdigit() and len(ds) == 8:
+                asof = dt.datetime.strptime(ds, "%Y%m%d").date()
+            else:
+                asof = dt.datetime.strptime(ds, "%Y-%m-%d").date()
+    except Exception:
+        pass
+
+    end = asof
     start = end - dt.timedelta(days=500)
+
     hist = get_price_history(stock_id, start, end)
     if hist.empty:
         return None
@@ -348,21 +366,43 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
     c = float(today_row["ClosingPrice"])       # today close (TWSE)
     v_today = float(today_row["TradeVolume"])  # shares (TWSE)
 
-    if len(hist) < (CONSOL_DAYS + 6):
+    # -------------------------
+    # 2) 依日期排除 today（不要用 iloc[:-1]，避免交易日錯位）
+    # -------------------------
+    if "date" not in hist.columns:
         return None
 
-    # EXCLUDE today in history for indicators (avoid look-ahead)
-    base = hist.iloc[:-1].copy()
+    hist = hist.copy()
+    hist["date"] = pd.to_datetime(hist["date"]).dt.date
+    hist = hist.sort_values("date")
+
+    base = hist[hist["date"] < asof].copy()  # ✅ 不含今日
     if len(base) < (CONSOL_DAYS + 6):
         return None
 
-    # ====== Volume check (MA5 exclude today) ======
-    ma5 = float(base["Trading_Volume"].iloc[-5:].mean())
-    vol_mult = (v_today / ma5) if ma5 > 0 else 0.0
-    if not (v_today > VOL_MULT * ma5):
+    # -------------------------
+    # 3) 漲跌幅：收 - 昨收（用 base 最後一天 close 當昨收）
+    # -------------------------
+    prev_close = float(base["close"].iloc[-1])
+    if prev_close <= 0:
+        return None
+    chg_pct = (c - prev_close) / prev_close
+
+    # ✅ 你要的門檻（如果你用全域常數就留著；否則這裡直接用 0.03）
+    if chg_pct < 0.03:
         return None
 
-    # ====== Consolidation breakout check ======
+    # -------------------------
+    # 4) Volume check：MA5 不含今日
+    # -------------------------
+    ma5 = float(base["Trading_Volume"].iloc[-5:].mean())
+    vol_mult = (v_today / ma5) if ma5 > 0 else 0.0
+    if not (ma5 > 0 and v_today > VOL_MULT * ma5):
+        return None
+
+    # -------------------------
+    # 5) Consolidation breakout：看「前 CONSOL_DAYS」(也不含今日)
+    # -------------------------
     prev20 = base.iloc[-CONSOL_DAYS:]
     high20 = float(prev20["max"].max())
     low20 = float(prev20["min"].min())
@@ -378,9 +418,9 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
 
     break_pct = (c / high20 - 1.0) if high20 > 0 else 0.0
 
-    # =========================
-    # NEW: MA20 / MA60 (use FinMind close, EXCLUDE today)
-    # =========================
+    # -------------------------
+    # 6) MA20 / MA60：用 base 的 close（不含今日）
+    # -------------------------
     ma20 = None
     ma60 = None
     if len(base) >= 20:
@@ -390,8 +430,12 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
 
     return {
         "Code": stock_id,
-        "Name": str(today_row["Name"]),
-        "chg": float(today_row["chg_pct"]),
+        "Name": str(today_row.get("Name", "")),
+
+        # ✅ 改成你要的「收-昨收」
+        "chg": float(chg_pct),
+
+        # ✅ 量能仍然是 shares vs shares（一致）
         "vol_mult": float(vol_mult),
         "lots": float(v_today / LOTS_UNIT),
         "range20_pct": float(width),
@@ -401,6 +445,10 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
         "close": float(c),
         "ma20": ma20,
         "ma60": ma60,
+
+        # (可選) debug 用：幫你確認是否真的是昨收與 MA5
+        "prev_close": float(prev_close),
+        "ma5_vol": float(ma5),
     }
 
 
