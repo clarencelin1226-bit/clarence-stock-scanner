@@ -509,7 +509,35 @@ def run():
         send_telegram("✅ 今日無符合『爆量長紅＋盤整突破（含2×5日均量）』個股")
         export_scanner_result([], signal_date, [], [])
         return
+# =====================================================
+# A / B 分類（嚴格版）
+# A: MA20 > MA60 > MA120 且 close > MA20
+# =====================================================
 
+hitsA = []
+hitsB = []
+
+for x in hits:
+    close = x.get("close")
+    ma20 = x.get("ma20")
+    ma60 = x.get("ma60")
+    ma120 = x.get("ma120")
+
+    if (
+        close is not None
+        and ma20 is not None
+        and ma60 is not None
+        and ma120 is not None
+        and (ma20 > ma60 > ma120)
+        and (close > ma20)
+    ):
+        x["signal_type"] = "A"
+        hitsA.append(x)
+    else:
+        x["signal_type"] = "B"
+        hitsB.append(x)
+
+    
     # ---- helper for sorting
     def is_main(sec: str) -> int:
         return 1 if sec in main_sectors else 0
