@@ -509,39 +509,37 @@ def run():
         send_telegram("✅ 今日無符合『爆量長紅＋盤整突破（含2×5日均量）』個股")
         export_scanner_result([], signal_date, [], [])
         return
-# =====================================================
-# A / B 分類（嚴格版）
-# A: MA20 > MA60 > MA120 且 close > MA20
-# =====================================================
+    # =====================================================
+    # A / B 分類（嚴格版）
+    # A: MA20 > MA60 > MA120 且 close > MA20
+    # =====================================================
 
-hitsA = []
-hitsB = []
+    hitsA = []
+    hitsB = []
 
-for x in hits:
-    close = x.get("close")
-    ma20 = x.get("ma20")
-    ma60 = x.get("ma60")
-    ma120 = x.get("ma120")
+    for x in hits:
+        close = x.get("close")
+        ma20 = x.get("ma20")
+        ma60 = x.get("ma60")
+        ma120 = x.get("ma120")
 
-    if (
-        close is not None
-        and ma20 is not None
-        and ma60 is not None
-        and ma120 is not None
-        and (ma20 > ma60 > ma120)
-        and (close > ma20)
-    ):
-        x["signal_type"] = "A"
-        hitsA.append(x)
-    else:
-        x["signal_type"] = "B"
-        hitsB.append(x)
+        if (
+            close is not None
+            and ma20 is not None
+            and ma60 is not None
+            and ma120 is not None
+            and (ma20 > ma60 > ma120)
+            and (close > ma20)
+        ):
+            x["signal_type"] = "A"
+            hitsA.append(x)
+        else:
+            x["signal_type"] = "B"
+            hitsB.append(x)
 
-    
     # ---- helper for sorting
     def is_main(sec: str) -> int:
         return 1 if sec in main_sectors else 0
-
 
     # ---- keep your original priority logic, but apply within A then B
     def sort_key(x):
@@ -560,17 +558,18 @@ for x in hits:
             tag = "🔥🔥" if sec in main_sectors else "•"
             ma20 = x.get("ma20", None)
             ma60 = x.get("ma60", None)
+            ma120 = x.get("ma120", None)
 
             ma_txt = ""
-            if (ma20 is not None) and (ma60 is not None):
-                ma_txt = f"｜MA20 {ma20:.2f}｜MA60 {ma60:.2f}"
+            if (ma20 is not None) and (ma60 is not None) and (ma120 is not None):
+                ma_txt = f"｜MA20 {ma20:.2f}｜MA60 {ma60:.2f}｜MA120 {ma120:.2f}"
 
             lines.append(
                 f"{tag}{x['Code']} {x['Name']}｜{x['chg']:.1f}%｜量倍 {x['vol_mult']:.2f}x｜突破 {x['break_pct']*100:.1f}%｜{sec}{ma_txt}"
             )
         return f"{title}\n" + "\n".join(lines)
 
-    msgA = build_lines(hitsA, "🅰️ 訊號A（多頭排列 + 站上MA20）")
+    msgA = build_lines(hitsA, "🅰️ 訊號A（MA20>MA60>MA120 + close>MA20）")
     msgB = build_lines(hitsB, "🅱️ 訊號B（符合原條件，但未達A）")
 
     if msgA:
@@ -586,6 +585,7 @@ for x in hits:
         stocks_b=[str(x["Code"]) for x in hitsB],
     )
     print("=== EOF reached ===")
+
     # =========================
 # Program entry point
 # =========================
