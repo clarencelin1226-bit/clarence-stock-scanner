@@ -514,20 +514,33 @@ def run():
     def is_main(sec: str) -> int:
         return 1 if sec in main_sectors else 0
 
-    # ---- NEW: classify A/B
-    # A: close >= MA20 AND MA20 > MA60  (both MA exist)
-    hitsA = []
-    hitsB = []
-    for x in hits:
-        close = x.get("close", None)
-        ma20 = x.get("ma20", None)
-        ma60 = x.get("ma60", None)
-        if (close is not None) and (ma20 is not None) and (ma60 is not None) and (close >= ma20) and (ma20 > ma60):
-            x["signal_type"] = "A"
-            hitsA.append(x)
-        else:
-            x["signal_type"] = "B"
-            hitsB.append(x)
+    # ---- NEW: classify A/B (STRICT)
+# A 條件：
+# 1. MA20 > MA60 > MA120
+# 2. close > MA20
+
+hitsA = []
+hitsB = []
+
+for x in hits:
+    close = x.get("close")
+    ma20 = x.get("ma20")
+    ma60 = x.get("ma60")
+    ma120 = x.get("ma120")
+
+    if (
+        close is not None
+        and ma20 is not None
+        and ma60 is not None
+        and ma120 is not None
+        and (ma20 > ma60 > ma120)
+        and (close > ma20)
+    ):
+        x["signal_type"] = "A"
+        hitsA.append(x)
+    else:
+        x["signal_type"] = "B"
+        hitsB.append(x)
 
     # ---- keep your original priority logic, but apply within A then B
     def sort_key(x):
