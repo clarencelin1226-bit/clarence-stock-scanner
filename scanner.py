@@ -418,37 +418,36 @@ def check_one_stock(stock_id: str, today_row: pd.Series) -> dict | None:
 
     break_pct = (c / high20 - 1.0) if high20 > 0 else 0.0
 
-    # -------------------------
-    # 6) MA20 / MA60：用 base 的 close（不含今日）
-    # -------------------------
+        # =========================
+    # NEW: MA20 / MA60 / MA120 (use FinMind close, EXCLUDE today)
+    # =========================
     ma20 = None
     ma60 = None
+    ma120 = None
+
+    s_close = base["close"].astype(float)
+
     if len(base) >= 20:
-        ma20 = float(base["close"].rolling(20).mean().iloc[-1])
+        ma20 = float(s_close.rolling(20).mean().iloc[-1])
     if len(base) >= 60:
-        ma60 = float(base["close"].rolling(60).mean().iloc[-1])
+        ma60 = float(s_close.rolling(60).mean().iloc[-1])
+    if len(base) >= 120:
+        ma120 = float(s_close.rolling(120).mean().iloc[-1])
 
     return {
         "Code": stock_id,
-        "Name": str(today_row.get("Name", "")),
-
-        # ✅ 改成你要的「收-昨收」
-        "chg": float(chg_pct),
-
-        # ✅ 量能仍然是 shares vs shares（一致）
+        "Name": str(today_row["Name"]),
+        "chg": float(today_row["chg_pct"]),
         "vol_mult": float(vol_mult),
         "lots": float(v_today / LOTS_UNIT),
         "range20_pct": float(width),
         "break_pct": float(break_pct),
 
-        # NEW
+        # MA context
         "close": float(c),
         "ma20": ma20,
         "ma60": ma60,
-
-        # (可選) debug 用：幫你確認是否真的是昨收與 MA5
-        "prev_close": float(prev_close),
-        "ma5_vol": float(ma5),
+        "ma120": ma120,
     }
 
 
